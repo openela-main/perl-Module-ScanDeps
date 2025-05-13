@@ -1,18 +1,24 @@
-# Run prefork optional test
+# Run prefork and optional test
 %if ! (0%{?rhel})
 %{bcond_without perl_Module_ScanDeps_enables_prefork}
+%{bcond_without perl_Module_ScanDeps_enables_optional_tests}
 %else
 %{bcond_with perl_Module_ScanDeps_enables_prefork}
+%{bcond_with perl_Module_ScanDeps_enables_optional_tests}
 %endif
 
 Name:           perl-Module-ScanDeps
 Summary:        Recursively scan Perl code for dependencies
 Version:        1.30
-Release:        5%{?dist}
+Release:        6%{?dist}
 License:        GPL+ or Artistic
 URL:            https://metacpan.org/release/Module-ScanDeps
 Source0:        https://cpan.metacpan.org/authors/id/R/RS/RSCHUPP/Module-ScanDeps-%{version}.tar.gz
 BuildArch:      noarch
+# Fixed CVE-2024-10224, in upstream since 1.36
+Patch1:         Module-ScanDeps-1.30-use-three-argument-open.patch
+Patch2:         Module-ScanDeps-1.30-replace-eval-constructs.patch
+Patch3:         Module-ScanDeps-1.30-fix-parsing-of-use-if.patch
 BuildRequires:  coreutils
 BuildRequires:  make
 BuildRequires:  perl-generators
@@ -57,6 +63,7 @@ BuildRequires:  perl(Net::FTP)
 BuildRequires:  perl(Test::More)
 BuildRequires:  perl(Test::Requires)
 # Optional tests:
+%if %{with perl_Module_ScanDeps_enables_optional_tests}
 BuildRequires:  perl(Module::Pluggable)
 %if !%{defined perl_bootstrap} && %{with perl_Module_ScanDeps_enables_prefork}
 # Cycle: perl-Module-ScanDeps → perl-prefork → perl-Perl-MinimumVersion
@@ -66,7 +73,7 @@ BuildRequires:  perl(Module::Pluggable)
 BuildRequires:  perl(prefork)
 %endif
 BuildRequires:  perl(Test::Pod) >= 1.00
-Requires:       perl(:MODULE_COMPAT_%(eval "$(perl -V:version)"; echo $version))
+%endif
 Requires:       perl(B)
 Requires:       perl(DynaLoader)
 Requires:       perl(Data::Dumper)
@@ -78,13 +85,52 @@ Recommends:     perl(Digest::MD5)
 Recommends:     perl(Storable)
 Suggests:       perl(CPANPLUS::Backend)
 
+# Filter modules bundled for tests
+%global __provides_exclude_from %{?__provides_exclude_from:%__provides_exclude_from|}^%{_libexecdir}/%{name}
+%global __requires_exclude_from %{?__requires_exclude_from:%__requires_exclude_from|}^%{_libexecdir}/%{name}/t/data
+%global __requires_exclude %{?__requires_exclude:%__requires_exclude|}^perl\\(Utils\\)
+%if %{defined perl_bootstrap} || %{without perl_Module_ScanDeps_enables_prefork}
+%global __requires_exclude %{?__requires_exclude:%__requires_exclude|}^perl\\(prefork\\)
+%endif
+
 %description
 This module scans potential modules used by perl programs and returns a
 hash reference.  Its keys are the module names as they appear in %%INC (e.g.
 Test/More.pm).  The values are hash references.
 
+%package tests
+Summary:        Tests for %{name}
+Requires:       %{name} = %{?epoch:%{epoch}:}%{version}-%{release}
+Requires:       perl-Test-Harness
+Requires:       perl(AutoLoader)
+Requires:       perl(autouse)
+Requires:       perl(Carp)
+Requires:       perl(if)
+Requires:       perl(less)
+Requires:       perl(Net::FTP)
+# Optional tests:
+%if %{with perl_Module_ScanDeps_enables_optional_tests}
+Requires:       perl(Module::Pluggable)
+%if !%{defined perl_bootstrap} && %{with perl_Module_ScanDeps_enables_prefork}
+Requires:       perl(prefork)
+%endif
+%endif
+
+%description tests
+Tests from %{name}. Execute them
+with "%{_libexecdir}/%{name}/test".
+
 %prep
 %setup -q -n Module-ScanDeps-%{version}
+%patch -P1 -p1
+%patch -P2 -p1
+%patch -P3 -p1
+
+# Help file to recognise the Perl scripts
+for F in `find t -name *.t -o -name *.pl`; do
+    perl -i -MConfig -ple 'print $Config{startperl} if $. == 1 && !s{\A#!.*perl\b}{$Config{startperl}}' "$F"
+    chmod +x "$F"
+done
 
 %build
 perl Makefile.PL INSTALLDIRS=vendor NO_PACKLIST=1 NO_PERLLOCAL=1
@@ -94,7 +140,27 @@ perl Makefile.PL INSTALLDIRS=vendor NO_PACKLIST=1 NO_PERLLOCAL=1
 %{make_install}
 %{_fixperms} %{buildroot}
 
+# Install tests
+mkdir -p %{buildroot}%{_libexecdir}/%{name}
+cp -a t %{buildroot}%{_libexecdir}/%{name}
+rm -f %{buildroot}%{_libexecdir}/%{name}/t/0-pod.t
+perl -i -pe 's{ "-Mblib",}{}' %{buildroot}%{_libexecdir}/%{name}/t/19-autosplit.t
+cat > %{buildroot}%{_libexecdir}/%{name}/test << 'EOF'
+#!/bin/bash
+set -e
+# Some tests write into temporary files/directories. The easiest solution
+# is to copy the tests into a writable directory and execute them from there.
+DIR=$(mktemp -d)
+pushd "$DIR"
+cp -a %{_libexecdir}/%{name}/* ./
+prove -I . -j "$(getconf _NPROCESSORS_ONLN)"
+popd
+rm -rf "$DIR"
+EOF
+chmod +x %{buildroot}%{_libexecdir}/%{name}/test
+
 %check
+export HARNESS_OPTIONS=j$(perl -e 'if ($ARGV[0] =~ /.*-j([0-9][0-9]*).*/) {print $1} else {print 1}' -- '%{?_smp_mflags}')
 make test
 
 %files
@@ -105,7 +171,15 @@ make test
 %{_mandir}/man1/scandeps.pl.1*
 %{_mandir}/man3/Module::ScanDeps.3pm*
 
+%files tests
+%{_libexecdir}/%{name}
+
 %changelog
+* Fri Nov 22 2024 Jitka Plesnikova <jplesnik@redhat.com> - 1.30-6
+- Resolves: RHEL-68282
+- Fix CVE-2024-10224
+- Package tests
+
 * Mon Aug 09 2021 Mohan Boddu <mboddu@redhat.com> - 1.30-5
 - Rebuilt for IMA sigs, glibc 2.34, aarch64 flags
   Related: rhbz#1991688
